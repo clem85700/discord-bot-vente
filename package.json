@@ -1,0 +1,7 @@
+{
+  "name": "discord-bot-vente",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Relais Shopify (commande créée) -> webhook Discord 'bot vente Clément'"
+}
