@@ -8,16 +8,42 @@ async function readRawBody(req) {
   return Buffer.concat(chunks);
 }
 
-// Authentifie la requête via un token secret passé dans l'URL (?token=...).
-// Seuls Shopify (qui envoie sur cette URL) et nous connaissons ce token.
-function hasValidToken(req, expected) {
-  if (!expected) return false;
-  const url = new URL(req.url, "https://placeholder.local");
-  return url.searchParams.get("token") === expected;
+// ── AIGUILLAGE ──────────────────────────────────────────────────────────────
+// Chaque token secret (passé dans l'URL ?token=...) mène à un salon Discord.
+// On n'ajoute une route QUE si ses 2 variables d'env existent, pour qu'un token
+// vide ne puisse jamais matcher par accident.
+function getRoutes() {
+  const routes = {};
+  if (process.env.WEBHOOK_TOKEN && process.env.DISCORD_WEBHOOK_URL) {
+    routes[process.env.WEBHOOK_TOKEN] = {
+      discordUrl: process.env.DISCORD_WEBHOOK_URL,
+      botName: "bot vente Clément",
+    };
+  }
+  if (process.env.WEBHOOK_TOKEN_SUCCESS && process.env.DISCORD_WEBHOOK_SUCCESS) {
+    routes[process.env.WEBHOOK_TOKEN_SUCCESS] = {
+      discordUrl: process.env.DISCORD_WEBHOOK_SUCCESS,
+      botName: "bot vente success",
+    };
+  }
+  return routes;
+}
+
+// Récupère le token de l'URL et renvoie la route correspondante (ou null).
+function resolveRoute(req) {
+  const token = new URL(req.url, "https://placeholder.local").searchParams.get("token");
+  if (!token) return null;
+  return getRoutes()[token] || null;
+}
+
+// "nyrofit.myshopify.com" -> "nyrofit" ; null si domaine absent.
+function shopLabel(domain) {
+  if (!domain) return null;
+  return domain.replace(/^https?:\/\//, "").replace(/\.myshopify\.com$/, "");
 }
 
 // Transforme la grosse commande Shopify en un petit objet propre, prêt à afficher.
-function extractSale(order) {
+function extractSale(order, shopDomain) {
   return {
     orderName: order.name || `#${order.order_number ?? ""}`, // ex: "#1042"
     items: (order.line_items || []).map((li) => ({ title: li.title, qty: li.quantity })),
@@ -30,26 +56,33 @@ function extractSale(order) {
       order.customer?.default_address?.city ||
       null,
     createdAt: order.created_at,                               // ISO 8601
+    shopName: shopLabel(shopDomain),                           // ex: "nyrofit"
   };
 }
 
 // Construit le message Discord (un "embed" = la carte colorée).
-function buildEmbed(sale) {
+function buildEmbed(sale, botName) {
   const products = sale.items.length
     ? sale.items.map((i) => `• ${i.qty}× ${i.title}`).join("\n")
     : "_(aucun article)_";
 
   const client = sale.city ? `${sale.firstName} — ${sale.city}` : sale.firstName;
 
+  const fields = [
+    { name: "💰 Montant", value: `**${sale.total} ${sale.currency}**`, inline: true },
+    { name: "🙋 Client", value: client, inline: true },
+  ];
+  // Affiché seulement quand on connaît la boutique (utile dans un salon partagé).
+  if (sale.shopName) {
+    fields.push({ name: "🏪 Boutique", value: sale.shopName, inline: true });
+  }
+
   return {
     title: `💸 Nouvelle vente ! ${sale.orderName}`,
     description: products,
     color: 10741301, // lime NyroFit #A3E635
-    fields: [
-      { name: "💰 Montant", value: `**${sale.total} ${sale.currency}**`, inline: true },
-      { name: "🙋 Client", value: client, inline: true },
-    ],
-    footer: { text: "NyroFit • bot vente Clément" },
+    fields,
+    footer: { text: sale.shopName ? `${sale.shopName} • ${botName}` : botName },
     timestamp: sale.createdAt,
   };
 }
@@ -57,9 +90,8 @@ function buildEmbed(sale) {
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  if (!hasValidToken(req, process.env.WEBHOOK_TOKEN)) {
-    return res.status(401).send("Unauthorized");
-  }
+  const route = resolveRoute(req);
+  if (!route) return res.status(401).send("Unauthorized");
 
   const raw = await readRawBody(req);
 
@@ -70,13 +102,13 @@ export default async function handler(req, res) {
     return res.status(400).send("Bad JSON");
   }
 
-  const sale = extractSale(order);
-  const embed = buildEmbed(sale);
+  const sale = extractSale(order, req.headers["x-shopify-shop-domain"]);
+  const embed = buildEmbed(sale, route.botName);
 
-  const r = await fetch(process.env.DISCORD_WEBHOOK_URL, {
+  const r = await fetch(route.discordUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: "bot vente Clément", embeds: [embed] }),
+    body: JSON.stringify({ username: route.botName, embeds: [embed] }),
   });
 
   if (!r.ok) {
